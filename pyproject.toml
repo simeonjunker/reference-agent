@@ -1,0 +1,30 @@
+[project]
+name = "reference-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Simeon Junker", email = "simeon.junker@uni-bielefeld.de" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "langchain-openai>=0.3.35",
+    "langgraph>=0.6.11",
+    "pillow>=13.0.0",
+    "python-dotenv>=1.2.4",
+]
+
+[project.scripts]
+reference-agent = "reference_agent:main"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+    "nbconvert>=7.17.2",
+    "nbformat>=5.11.1",
+    "pytest>=8.4.2",
+]
