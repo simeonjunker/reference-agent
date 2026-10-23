@@ -1,6 +1,8 @@
 import base64
 import io
 import os
+import random
+import re
 from pathlib import Path
 from typing import TypedDict
 
@@ -21,15 +23,31 @@ Describe the target in one or two short sentences so that someone could pick it 
 from the two distractors. Mention only visible features that distinguish the target \
 from both distractors, and make no assumptions beyond what is visible."""
 
+REFINE_INSTRUCTION = """\
+A listener who saw the three images without labels read the description below and wrongly \
+picked {chosen} as the described image, so it is not discriminative enough. \
+Rewrite the description of the target in one or two short sentences, using visible features \
+that clearly set the target apart from both distractors. Reply with the new description only."""
+
+LISTENER_INSTRUCTION = """\
+Below are three images and a description of exactly one of them. \
+Which image does the description refer to? Answer with only the number 1, 2 or 3."""
+
+# Upper bound on listener evaluations; reaching it without success raises an error.
+MAX_EVAL_ROUNDS = 10
+
 ImageInput = str | Path | Image.Image
 
 
-# Graph state: the three image inputs, plus the description written by the "describe" node.
+# Graph state: the three image inputs, the current description candidate, the role the listener
+# picked for it, and the number of listener evaluations so far.
 class State(TypedDict, total=False):
     target: ImageInput
     distractor1: ImageInput
     distractor2: ImageInput
     description: str
+    listener_choice: str
+    attempts: int
 
 
 def default_model(temperature=0) -> ChatOpenAI:
@@ -51,6 +69,9 @@ def default_model(temperature=0) -> ChatOpenAI:
         model=model,
         api_key=api_key,
         temperature=temperature,
+        # Fail fast instead of hanging on an unreachable server; no silent retries.
+        timeout=float(os.environ.get("VLM_TIMEOUT", "300")),
+        max_retries=int(os.environ.get("VLM_MAX_RETRIES", "0")),
     )
 
 
@@ -88,29 +109,91 @@ def image_part(image: ImageInput) -> dict:
     return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(raw).decode()}"}}
 
 
-def build_graph(model: BaseChatModel | None = None):
-    model = model or default_model()
+def labeled_images(state: State) -> list[dict]:
+    # For each image a text label followed by the image, so roles are unambiguous.
+    parts = []
+    for key in IMAGE_KEYS:
+        parts.append({"type": "text", "text": f"{LABELS[key]}:"})
+        parts.append(image_part(state[key]))
+    return parts
 
-    # Node 2: build one multimodal message and make the single VLM call.
+
+# rng is injectable so the listener's image order can be made deterministic in tests.
+# use_listener=False builds the simple variant: validate -> describe -> END, with no
+# listener evaluation and no refinement.
+def build_graph(
+    model: BaseChatModel | None = None,
+    rng: random.Random | None = None,
+    use_listener: bool = True,
+):
+    model = model or default_model()
+    rng = rng or random.Random()
+
+    # Node 2: build one multimodal message and make the initial VLM call.
     def describe(state: State) -> dict:
-        # Message layout: instruction, then for each image a text label followed by the image,
-        # so the model can tell target and distractors apart by role.
-        content = [{"type": "text", "text": INSTRUCTION}]
-        for key in IMAGE_KEYS:
-            content.append({"type": "text", "text": f"{LABELS[key]}:"})
-            content.append(image_part(state[key]))
-        # The only model invocation; errors are not caught and reach the caller.
+        content = [{"type": "text", "text": INSTRUCTION}] + labeled_images(state)
+        # Errors are not caught and reach the caller.
         response = model.invoke([{"role": "user", "content": content}])
-        # Write the model's answer to the state unchanged.
         return {"description": response.content}
 
-    # Linear flow: START -> validate -> describe -> END.
+    # Node 3: a blind listener must pick the described image out of the three, in random order.
+    def internal_listener_eval(state: State) -> dict:
+        order = list(IMAGE_KEYS)
+        rng.shuffle(order)
+        # Unlabeled "Image 1..3" so the listener cannot see which one is the target.
+        content = [{"type": "text", "text": LISTENER_INSTRUCTION}]
+        for number, key in enumerate(order, start=1):
+            content.append({"type": "text", "text": f"Image {number}:"})
+            content.append(image_part(state[key]))
+        content.append({"type": "text", "text": f"Description: {state['description']}"})
+        answer = model.invoke([{"role": "user", "content": content}]).content
+        match = re.fullmatch(r"(?:Image\s*)?([123])\.?", answer.strip(), re.IGNORECASE)
+        if match is None:
+            raise ValueError(f"Listener answer is not 1, 2 or 3: {answer!r}")
+        # Map the chosen position back to the role of that image.
+        return {
+            "listener_choice": order[int(match.group(1)) - 1],
+            "attempts": state.get("attempts", 0) + 1,
+        }
+
+    # Node 4: rewrite the description, telling the model which image the listener confused it with.
+    def refine(state: State) -> dict:
+        instruction = REFINE_INSTRUCTION.format(chosen=LABELS[state["listener_choice"]])
+        content = (
+            [{"type": "text", "text": instruction}]
+            + labeled_images(state)
+            + [{"type": "text", "text": f"Current description: {state['description']}"}]
+        )
+        response = model.invoke([{"role": "user", "content": content}])
+        return {"description": response.content}
+
+    # Finish when the listener found the target; otherwise refine, unless the round limit is hit.
+    def route_after_eval(state: State) -> str:
+        if state["listener_choice"] == "target":
+            return END
+        if state["attempts"] >= MAX_EVAL_ROUNDS:
+            raise RuntimeError(
+                f"No discriminative description after {MAX_EVAL_ROUNDS} rounds; "
+                f"last candidate: {state['description']!r}"
+            )
+        return "refine"
+
     graph = StateGraph(State)
     graph.add_node("validate", validate)
     graph.add_node("describe", describe)
     graph.add_edge(START, "validate")
     graph.add_edge("validate", "describe")
-    graph.add_edge("describe", END)
+    if not use_listener:
+        # Simple variant: terminate right after the initial description.
+        graph.add_edge("describe", END)
+        return graph.compile()
+
+    # Full variant: describe -> internal_listener_eval -> (END | refine -> eval ...).
+    graph.add_node("internal_listener_eval", internal_listener_eval)
+    graph.add_node("refine", refine)
+    graph.add_edge("describe", "internal_listener_eval")
+    graph.add_conditional_edges("internal_listener_eval", route_after_eval, ["refine", END])
+    graph.add_edge("refine", "internal_listener_eval")
     return graph.compile()
 
 
@@ -120,8 +203,9 @@ def describe_target(
     distractor1: ImageInput,
     distractor2: ImageInput,
     model: BaseChatModel | None = None,
+    use_listener: bool = True,
 ) -> str:
-    result = build_graph(model).invoke(
+    result = build_graph(model, use_listener=use_listener).invoke(
         {"target": target, "distractor1": distractor1, "distractor2": distractor2}
     )
     return result["description"]
